@@ -5238,7 +5238,9 @@ enum MenuPage {
   PAGE_MEDIA_SETTINGS,
   PAGE_SCREEN_SETTINGS,
   PAGE_IDLE_SCREEN,
-  PAGE_THEME
+  PAGE_THEME,
+  PAGE_INPUT_NAMES,
+  PAGE_INPUT_NAME_EDIT
 };
 
 enum LegacyUiColourChoice : uint8_t {
@@ -5442,6 +5444,22 @@ static const uint8_t SRC_COUNT = SRC_MAX + 1;
 // S/PDIF inputs the panel can track. Firmware v1.1.5 reports 4; older builds
 // report 3, and a future build reporting more is clamped to this.
 static const uint8_t PANEL_MAX_SPDIF_INPUTS = 4;
+
+// System > Input Names: a cosmetic, panel-only rename per InputSource. Never
+// sent to the DSPi -- inputSourceDisplayText() below just substitutes this
+// in place of the built-in label when one has been set. An empty string
+// means "use the default label".
+String inputCustomName[SRC_COUNT];
+
+static const uint8_t INPUT_NAME_MAX_LEN = 14;
+// Rotary-encoder-friendly charset for the name editor: space first (so
+// trailing/unused positions collapse away on save), then A-Z, 0-9, and a
+// handful of separators common in device names.
+static const char INPUT_NAME_CHARSET[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/.-+&";
+static const uint8_t INPUT_NAME_CHARSET_LEN = sizeof(INPUT_NAME_CHARSET) - 1;
+
+char inputNameEditBuffer[INPUT_NAME_MAX_LEN + 1] = {0};
+InputSource inputNameEditSource = SRC_USB;
 
 enum UiAction : uint8_t {
   ACT_NONE,
@@ -5788,7 +5806,7 @@ int editOriginalInt = 0;
 bool editBool = false;
 bool editOriginalBool = false;
 
-uint8_t rememberedMenuIndex[PAGE_THEME + 1] = {};
+uint8_t rememberedMenuIndex[PAGE_INPUT_NAME_EDIT + 1] = {};
 uint8_t lastMainMenuIndex = 0;
 
 uint8_t brightnessPercent = 80;
@@ -7775,7 +7793,7 @@ InputSource nextInputSourceChoice(InputSource current, int direction)
   return current;
 }
 
-String inputSourceDisplayText(InputSource source)
+String defaultInputSourceLabel(InputSource source)
 {
   switch (source) {
     case SRC_USB: return "USB";
@@ -7787,6 +7805,17 @@ String inputSourceDisplayText(InputSource source)
     case SRC_OPTICAL_4: return "S/PDIF 4";
   }
   return "Unknown";
+}
+
+String inputSourceDisplayText(InputSource source)
+{
+  // System > Input Names lets the user substitute their own label here,
+  // purely for the panel's own display -- it is never written back to the
+  // DSPi, which keeps calling this input whatever its own firmware calls it.
+  if (source < SRC_COUNT && inputCustomName[source].length()) {
+    return inputCustomName[source];
+  }
+  return defaultInputSourceLabel(source);
 }
 
 bool syncCurrentState(bool includePresetNames)
@@ -10636,6 +10665,8 @@ String pageTitle(MenuPage page)
     case PAGE_SCREEN_SETTINGS: return "Screen Settings";
     case PAGE_IDLE_SCREEN: return "Idle Screen";
     case PAGE_THEME: return "Theme";
+    case PAGE_INPUT_NAMES: return "Input Names";
+    case PAGE_INPUT_NAME_EDIT: return inputSourceDisplayText(inputNameEditSource);
   }
   return "Menu";
 }
@@ -10738,12 +10769,14 @@ uint8_t menuItemCount(MenuPage page)
     case PAGE_LEVELLER: return 6;
     case PAGE_PSYBASS: return 6;
     case PAGE_BLUETOOTH: return bleMenuItemCount();
-    case PAGE_SYSTEM: return 3;
+    case PAGE_SYSTEM: return 4;
     case PAGE_MEDIA_SETTINGS: return 1;
     case PAGE_SCREEN_SETTINGS: return 4;
     case PAGE_IDLE_SCREEN:
       return screenTimeoutAction == SCREEN_TIMEOUT_DIM ? 5 : 4;
     case PAGE_THEME: return 4;
+    case PAGE_INPUT_NAMES: return SRC_COUNT;
+    case PAGE_INPUT_NAME_EDIT: return INPUT_NAME_MAX_LEN;
   }
   return 1;
 }
@@ -10779,8 +10812,8 @@ String menuItemName(MenuPage page, uint8_t index)
     return bleMenuItemName(index);
   }
   if (page == PAGE_SYSTEM) {
-    const char *items[] = {"Status", "Screen Settings", "Volume Limit"};
-    return items[std::min<uint8_t>(index, 2)];
+    const char *items[] = {"Status", "Screen Settings", "Volume Limit", "Input Names"};
+    return items[std::min<uint8_t>(index, 3)];
   }
   if (page == PAGE_MEDIA_SETTINGS) return "Seek Step";
   if (page == PAGE_SCREEN_SETTINGS) {
@@ -10800,6 +10833,18 @@ String menuItemName(MenuPage page, uint8_t index)
     if (index == 1) return "Accent Colour";
     if (index == 2) return "Volume Meters Colour";
     return "Analog VU Colour";
+  }
+  if (page == PAGE_INPUT_NAMES) {
+    return defaultInputSourceLabel((InputSource)std::min<uint8_t>(index, SRC_MAX));
+  }
+  if (page == PAGE_INPUT_NAME_EDIT) {
+    String preview;
+    for (uint8_t i = 0; i < INPUT_NAME_MAX_LEN; i++) {
+      if (i == index) preview += '[';
+      preview += inputNameEditBuffer[i];
+      if (i == index) preview += ']';
+    }
+    return preview;
   }
   return "";
 }
@@ -10892,6 +10937,10 @@ String currentEditValue()
     if (menuIndex < 3) return "";
     return vuColourChoiceText((VuColourChoice)editInt);
   }
+  if (menuPage == PAGE_INPUT_NAME_EDIT) {
+    char ch = INPUT_NAME_CHARSET[constrain(editInt, 0, INPUT_NAME_CHARSET_LEN - 1)];
+    return ch == ' ' ? "_" : String(ch);
+  }
   return "";
 }
 
@@ -10941,7 +10990,8 @@ String menuItemValue(MenuPage page, uint8_t index)
   if (page == PAGE_SYSTEM) {
     if (index == 0) return dspi.connected ? "Ready" : "Fault";
     if (index == 1) return "Open";
-    return String(dspi.masterVolumeDb, 1) + " dB";
+    if (index == 2) return String(dspi.masterVolumeDb, 1) + " dB";
+    return "Open";
   }
   if (page == PAGE_MEDIA_SETTINGS) {
     return mediaSeekStepText(mediaSeekStepIndex);
@@ -10959,6 +11009,15 @@ String menuItemValue(MenuPage page, uint8_t index)
   if (page == PAGE_THEME) {
     if (index < 3) return "";
     return vuColourChoiceText(analogVuColourChoice);
+  }
+  if (page == PAGE_INPUT_NAMES) {
+    InputSource source = (InputSource)std::min<uint8_t>(index, SRC_MAX);
+    return source < SRC_COUNT && inputCustomName[source].length()
+           ? inputCustomName[source] : "Default";
+  }
+  if (page == PAGE_INPUT_NAME_EDIT) {
+    char ch = index < INPUT_NAME_MAX_LEN ? inputNameEditBuffer[index] : ' ';
+    return ch == ' ' ? "_" : String(ch);
   }
   return "";
 }
@@ -13441,6 +13500,27 @@ void cancelActiveEdit()
   editActive = false;
 }
 
+void commitInputNameEdit()
+{
+  // Trailing spaces (untouched positions) are trimmed away; a name that ends
+  // up empty just means "use the default label" again.
+  String trimmed;
+  for (uint8_t i = 0; i < INPUT_NAME_MAX_LEN; i++) {
+    trimmed += inputNameEditBuffer[i];
+  }
+  while (trimmed.length() && trimmed.charAt(trimmed.length() - 1) == ' ') {
+    trimmed.remove(trimmed.length() - 1);
+  }
+
+  if (inputNameEditSource >= SRC_COUNT) return;
+  if (inputCustomName[inputNameEditSource] == trimmed) return; // nothing changed
+
+  inputCustomName[inputNameEditSource] = trimmed;
+  char key[16];
+  snprintf(key, sizeof(key), "in_nm_%u", (unsigned)inputNameEditSource);
+  preferences.putString(key, trimmed);
+}
+
 void goBack()
 {
   if (uiView == VIEW_MEDIA_NOW_PLAYING) {
@@ -13488,6 +13568,15 @@ void goBack()
     enterPage(PAGE_SCREEN_SETTINGS);
     return;
   }
+  if (menuPage == PAGE_INPUT_NAME_EDIT) {
+    commitInputNameEdit();
+    enterPage(PAGE_INPUT_NAMES);
+    return;
+  }
+  if (menuPage == PAGE_INPUT_NAMES) {
+    enterPage(PAGE_SYSTEM);
+    return;
+  }
   if (menuPage != PAGE_MAIN) {
     if (menuPage == PAGE_MEDIA && leaveMediaFolder()) {
       return;
@@ -13500,6 +13589,14 @@ void goBack()
     return;
   }
   transitionToHome();
+}
+
+int8_t inputNameCharsetIndex(char ch)
+{
+  for (uint8_t i = 0; i < INPUT_NAME_CHARSET_LEN; i++) {
+    if (INPUT_NAME_CHARSET[i] == ch) return (int8_t)i;
+  }
+  return 0; // unexpected char (shouldn't happen) -> falls back to space
 }
 
 void beginEdit()
@@ -13544,6 +13641,9 @@ void beginEdit()
     else if (menuIndex == 1) editInt = accentPaletteIndex;
     else if (menuIndex == 2) editInt = volumeMeterPaletteIndex;
     else editInt = analogVuColourChoice;
+  } else if (menuPage == PAGE_INPUT_NAME_EDIT) {
+    char current = menuIndex < INPUT_NAME_MAX_LEN ? inputNameEditBuffer[menuIndex] : ' ';
+    editInt = inputNameCharsetIndex(current);
   }
   encoderMenuDetentRemainder = 0;
   editOriginalFloat = editFloat;
@@ -13636,6 +13736,8 @@ void adjustEdit(int direction)
       editInt = wrapEditInt(editInt, direction, 1, 0,
                             VU_COLOUR_CHOICE_COUNT - 1);
     }
+  } else if (menuPage == PAGE_INPUT_NAME_EDIT) {
+    editInt = wrapEditInt(editInt, direction, 1, 0, INPUT_NAME_CHARSET_LEN - 1);
   }
   drawMenu();
 }
@@ -13647,6 +13749,25 @@ void applyEdit()
   if (menuPage == PAGE_INPUT &&
       !inputSourceAvailable((InputSource)editInt)) {
     showToast("Enable in Console");
+    drawMenu();
+    return;
+  }
+
+  if (menuPage == PAGE_INPUT_NAME_EDIT) {
+    // Character-by-character editor: commit the chosen character and, unless
+    // we're already at the last position, auto-advance so typing a name is a
+    // simple repeated rotate-then-click without a toast popping up after
+    // every single letter. The name itself is only persisted when the user
+    // backs out of this page (see backOut()).
+    if (menuIndex < INPUT_NAME_MAX_LEN) {
+      inputNameEditBuffer[menuIndex] =
+          INPUT_NAME_CHARSET[constrain(editInt, 0, INPUT_NAME_CHARSET_LEN - 1)];
+    }
+    editActive = false;
+    if (menuIndex + 1 < INPUT_NAME_MAX_LEN) {
+      menuIndex++;
+      rememberedMenuIndex[PAGE_INPUT_NAME_EDIT] = menuIndex;
+    }
     drawMenu();
     return;
   }
@@ -13878,6 +13999,23 @@ void selectMenuItem()
 
   if (menuPage == PAGE_SYSTEM && menuIndex == 1) {
     enterPage(PAGE_SCREEN_SETTINGS);
+    return;
+  }
+
+  if (menuPage == PAGE_SYSTEM && menuIndex == 3) {
+    enterPage(PAGE_INPUT_NAMES);
+    return;
+  }
+
+  if (menuPage == PAGE_INPUT_NAMES) {
+    InputSource source = (InputSource)std::min<uint8_t>(menuIndex, SRC_MAX);
+    inputNameEditSource = source;
+    String current = source < SRC_COUNT ? inputCustomName[source] : "";
+    for (uint8_t i = 0; i < INPUT_NAME_MAX_LEN; i++) {
+      inputNameEditBuffer[i] = i < current.length() ? current.charAt(i) : ' ';
+    }
+    inputNameEditBuffer[INPUT_NAME_MAX_LEN] = '\0';
+    enterPage(PAGE_INPUT_NAME_EDIT);
     return;
   }
 
@@ -18018,6 +18156,12 @@ void setup()
     screenTimeoutAction = SCREEN_TIMEOUT_DIM;
   }
   if (screenDimPercent == 0) screenDimPercent = 20;
+
+  for (uint8_t i = 0; i < SRC_COUNT; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "in_nm_%u", (unsigned)i);
+    inputCustomName[i] = preferences.getString(key, "");
+  }
 
   mediaSeekStepIndex = std::min<uint8_t>(
       preferences.getUChar("media_seek", 1), 2);
