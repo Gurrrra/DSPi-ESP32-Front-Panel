@@ -116,12 +116,11 @@
 #define MEDIA_SD_MOSI LCD_MOSI
 #define MEDIA_SD_MISO LCD_MISO
 
-// Local-player I2S link. DSPi is the clock master; the ESP32-S3 only drives
-// standard Philips stereo data with 32-bit slots (24 significant MSBs).
-#define MEDIA_I2S_DATA_OUT_PIN 13
-#define MEDIA_I2S_BCLK_PIN     14
-#define MEDIA_I2S_LRCLK_PIN    15
-#define MEDIA_PICO_RX_PIN       1
+// Local-player consumer S/PDIF link. GPIO13 carries a self-clocking 24-bit
+// BMC stream directly to DSPi S/PDIF input 1 on Pico GPIO5. No external
+// BCLK/LRCLK wires are used by this local test build.
+#define MEDIA_SPDIF_DATA_OUT_PIN 13
+#define MEDIA_PICO_SPDIF_RX_PIN   5
 // The browser keeps one sorted page instead of one entry for every folder.
 // Crossing a page boundary rescans the directory using a stable cursor, so the
 // number of folders in a directory is no longer limited by ESP32 RAM. Album
@@ -5436,6 +5435,9 @@ enum InputSource : uint8_t {
   SRC_OPTICAL_4 = 6
 };
 
+static const InputSource MEDIA_DSPI_SPDIF_SOURCE = SRC_OPTICAL;
+static const uint8_t MEDIA_DSPI_SPDIF_INPUT_INDEX = 0;
+
 // Highest source this panel understands, and the count derived from it. Every
 // readback bound check uses these, so adding a source is a one-line change.
 static const uint8_t SRC_MAX = SRC_OPTICAL_4;
@@ -5460,6 +5462,11 @@ static const uint8_t INPUT_NAME_CHARSET_LEN = sizeof(INPUT_NAME_CHARSET) - 1;
 
 char inputNameEditBuffer[INPUT_NAME_MAX_LEN + 1] = {0};
 InputSource inputNameEditSource = SRC_USB;
+
+// Screen Settings > VU Source. false = Output (post-DSP, unchanged default
+// behaviour), true = Input (pre-DSP). Applies to Home meters and both
+// full-screen VU pages.
+bool vuMeterSourceInput = false;
 
 enum UiAction : uint8_t {
   ACT_NONE,
@@ -5585,12 +5592,16 @@ struct MediaDspiRouteSnapshot {
   uint32_t selectedRate = 48000;
   uint32_t activeRate = 0;
   uint8_t clockMode = 0;
-  uint8_t rxPin = MEDIA_PICO_RX_PIN;
+  uint8_t rxPin = MEDIA_PICO_SPDIF_RX_PIN;
 };
 
 MediaDspiRouteSnapshot mediaRoute;
 bool mediaRouteRestorePending = false;
 unsigned long mediaRouteRestoreRetryAt = 0;
+// DSPi deliberately treats a SET to its already-selected input as a no-op.
+// Track whether a real source transition has run since link-up so a cold boot
+// directly into the media S/PDIF input can be re-armed exactly once.
+bool mediaDspiSourcePrimed = false;
 bool mediaPresetRefreshPending = false;
 unsigned long mediaPresetRefreshAt = 0;
 uint8_t mediaPresetRefreshAttempts = 0;
@@ -7459,6 +7470,7 @@ DspiTxnResult dspiTransactionResult(bool isGet, uint8_t request, uint16_t value,
     dspiFailureCount++;
     if (dspiFailureCount >= 4 && dspi.connected) {
       dspi.connected = false;
+      mediaDspiSourcePrimed = false;
       resetMetersForStateChange("DSPi link lost");
     }
   }
@@ -7982,6 +7994,7 @@ bool syncCurrentState(bool includePresetNames)
                          "DSPi link restored";
     resetMetersForStateChange(reason);
   }
+  if (oldConnected && sourceChanged) mediaDspiSourcePrimed = true;
 
   // Publish only verified DSPi state. A preset load can also restore its saved
   // source; in that case the preset identity is the more useful distance view.
@@ -8035,6 +8048,9 @@ bool pollExternalRuntimeState()
   uint8_t observedCrossfeed = dspi.crossfeedEnabled ? 1 : 0;
   uint8_t observedLeveller = dspi.levellerEnabled ? 1 : 0;
   uint8_t observedPsybass = dspi.psybassEnabled ? 1 : 0;
+  uint8_t observedSpdifState = dspi.spdifState;
+  uint32_t observedSampleRate = dspi.sampleRate;
+  bool observedSpdifNonAudio = dspi.spdifNonAudio;
 
   // Publish every exact read independently. One unsupported or temporarily
   // busy GET must not freeze unrelated Console state such as volume, preset,
@@ -8061,6 +8077,41 @@ bool pollExternalRuntimeState()
       getExactByte(REQ_GET_PSYBASS, observedPsybass, 0, false) &&
       observedPsybass <= 1;
 
+  // The normal runtime watcher is also used while the SD decoder is active.
+  // Keep S/PDIF lock metadata in that lightweight path: activateMediaRoute()
+  // publishes ACQUIRING before the first encoded silence reaches the Pico,
+  // and without this exact read Home would retain PCM NO LOCK until a full
+  // sweep (for example, entering the VU screen) happened by coincidence.
+  const InputSource observedInput = sourceValid
+      ? (InputSource)observedSource : dspi.source;
+  bool spdifStatusValid = false;
+  if (isSpdifSource(observedInput)) {
+    uint8_t statusPayload[16] = {0};
+    spdifStatusValid =
+        getExact(REQ_GET_SPDIF_RX_STATUS, 0, 16, statusPayload,
+                 sizeof(statusPayload), false) &&
+        statusPayload[0] <= 3 && statusPayload[1] == (uint8_t)observedInput;
+    if (spdifStatusValid) {
+      observedSpdifState = statusPayload[0];
+      observedSampleRate = readLe32(statusPayload + 4);
+      if (observedSpdifState == 2) {
+        uint8_t channelStatus[24] = {0};
+        const bool channelStatusValid = getExact(
+            REQ_GET_SPDIF_RX_CH_STATUS, 0, 24, channelStatus,
+            sizeof(channelStatus), false);
+        if (channelStatusValid) {
+          observedSpdifNonAudio = (channelStatus[0] & 0x02u) != 0;
+        }
+      } else {
+        observedSpdifNonAudio = false;
+      }
+    }
+  } else if (sourceValid) {
+    spdifStatusValid = true;
+    observedSpdifState = 0;
+    observedSpdifNonAudio = false;
+  }
+
   const bool volumeChanged = volumeValid &&
       fabsf(observedVolume - dspi.volumeDb) > 0.01f;
   const bool presetChanged = presetValid &&
@@ -8075,9 +8126,14 @@ bool pollExternalRuntimeState()
       (observedLeveller != 0) != dspi.levellerEnabled;
   const bool psybassChanged = psybassValid &&
       (observedPsybass != 0) != dspi.psybassEnabled;
+  const bool spdifStatusChanged = spdifStatusValid &&
+      (observedSpdifState != dspi.spdifState ||
+       observedSpdifNonAudio != dspi.spdifNonAudio ||
+       (isSpdifSource(observedInput) &&
+        observedSampleRate != dspi.sampleRate));
   const bool anyChanged = volumeChanged || presetChanged || sourceChanged ||
       loudnessChanged || crossfeedChanged || levellerChanged ||
-      psybassChanged;
+      psybassChanged || spdifStatusChanged;
 
   if (volumeValid) dspi.volumeDb = observedVolume;
   if (presetValid) dspi.activePreset = observedPreset;
@@ -8086,7 +8142,20 @@ bool pollExternalRuntimeState()
   if (crossfeedValid) dspi.crossfeedEnabled = observedCrossfeed != 0;
   if (levellerValid) dspi.levellerEnabled = observedLeveller != 0;
   if (psybassValid) dspi.psybassEnabled = observedPsybass != 0;
+  if (spdifStatusValid) {
+    dspi.spdifState = observedSpdifState;
+    dspi.spdifNonAudio = observedSpdifNonAudio;
+    if (isSpdifSource(observedInput)) dspi.sampleRate = observedSampleRate;
+  }
   if (presetChanged) applyPresetPanelSettings(dspi.activePreset);
+
+  if (spdifStatusChanged) {
+    resetMetersForStateChange(observedSpdifState == 2 &&
+                              !observedSpdifNonAudio
+                                  ? "S/PDIF signal locked"
+                                  : "S/PDIF signal state changed");
+  }
+  if (sourceChanged) mediaDspiSourcePrimed = true;
 
   const bool notificationsAllowed = externalRuntimeStateReady;
   externalRuntimeStateReady = true;
@@ -8124,6 +8193,15 @@ bool pollExternalRuntimeState()
 
 uint8_t meterLeftChannelIndex()
 {
+  // Screen Settings > VU Source: "Input" reads the first stereo pair in the
+  // status packet (indices 0/1) instead of the post-DSP output pair.
+  // NOTE: on the expanded beta4 17-channel packet, indices 0-7 are eight
+  // separate input channels (not a single repeated stereo pair per source),
+  // so "Input" here shows input channels 0/1 specifically. If your DSPi
+  // firmware maps the *currently selected* input source to a different pair
+  // on that packet layout, adjust the returned index accordingly.
+  if (vuMeterSourceInput) return 0;
+
   // The unit's expanded beta4 status packet has eight inputs followed by
   // outputs at 8/9. The accepted compact Pico layouts use outputs at 2/3.
   return dspi.meterChannelCount >= 17 ? 8 : 2;
@@ -8407,6 +8485,7 @@ bool setInputSource(InputSource source, bool userInitiated)
   InputSource oldSource = dspi.source;
   dspi.source = (InputSource)readback;
   if (oldSource != dspi.source) {
+    mediaDspiSourcePrimed = true;
     Serial.printf("DSPi source change: old=%u new=%u reason=local SET\n",
                   (unsigned)oldSource, (unsigned)dspi.source);
   }
@@ -8454,38 +8533,25 @@ bool restoreDspiMediaRoute()
   bool ok = false;
   for (uint8_t attempt = 0; attempt < 4 && dspi.connected; attempt++) {
     if (attempt) delay(80);
-
-    bool commandsOk = setDspiInputRate(mediaRoute.selectedRate) &&
-                      dspiSetByte(REQ_SET_I2S_CLOCK_MODE,
-                                  mediaRoute.clockMode);
-
     uint8_t liveSource = 0xFF;
     bool sourceRead = getExactByte(REQ_GET_INPUT_SOURCE, liveSource) &&
                       liveSource <= SRC_MAX;
+    bool commandsOk = true;
     if (!sourceRead || liveSource != mediaRoute.source) {
-      commandsOk = setInputSource(mediaRoute.source, false) && commandsOk;
+      commandsOk = setInputSource(mediaRoute.source, false);
     } else {
       dspi.source = (InputSource)liveSource;
     }
 
-    uint32_t currentRate = 0;
-    uint32_t selectedRate = 0;
-    uint8_t verifiedMode = 0xFF;
     uint8_t verifiedSource = 0xFF;
     ok = commandsOk &&
-         getDspiInputRates(currentRate, selectedRate) &&
-         getExactByte(REQ_GET_I2S_CLOCK_MODE, verifiedMode) &&
          getExactByte(REQ_GET_INPUT_SOURCE, verifiedSource) &&
-         selectedRate == mediaRoute.selectedRate &&
-         verifiedMode == mediaRoute.clockMode &&
          verifiedSource == mediaRoute.source;
     if (ok) break;
   }
 
-  Serial.printf("MEDIA ROUTE: restore source=%u rate=%lu mode=%u result=%s\n",
-                (unsigned)mediaRoute.source,
-                (unsigned long)mediaRoute.selectedRate,
-                mediaRoute.clockMode, ok ? "OK" : "FAILED");
+  Serial.printf("MEDIA ROUTE: restore source=%u result=%s\n",
+                (unsigned)mediaRoute.source, ok ? "OK" : "FAILED");
   if (ok) {
     mediaRoute = MediaDspiRouteSnapshot{};
     mediaRouteRestorePending = false;
@@ -8556,95 +8622,99 @@ bool activateDspiMediaRoute(uint32_t sampleRate, bool userInitiated)
     return false;
   }
 
-  // Consecutive tracks at the same native rate keep the proven I2S route.
-  // Avoid a full UART capture/configure/verify cycle between album tracks;
-  // that work previously caused multi-second main-loop stalls.
+  uint8_t spdifConfig[2 + PANEL_MAX_SPDIF_INPUTS] = {0};
+  uint16_t spdifLength = 0;
+  if (!dspiGet(REQ_GET_SPDIF_INPUT_CONFIG, 0, sizeof(spdifConfig),
+               spdifConfig, sizeof(spdifConfig), spdifLength) ||
+      spdifLength < (uint16_t)(3 + MEDIA_DSPI_SPDIF_INPUT_INDEX) ||
+      spdifConfig[0] <= MEDIA_DSPI_SPDIF_INPUT_INDEX ||
+      (spdifConfig[1] & (1u << MEDIA_DSPI_SPDIF_INPUT_INDEX)) == 0) {
+    Serial.println("MEDIA ROUTE: DSPi S/PDIF input 1 is unavailable");
+    return false;
+  }
+
+  const uint8_t rxPin = spdifConfig[2 + MEDIA_DSPI_SPDIF_INPUT_INDEX];
+  if (rxPin != MEDIA_PICO_SPDIF_RX_PIN) {
+    Serial.printf(
+        "MEDIA ROUTE: DSPi S/PDIF input 1 is GPIO%u; wire expects GPIO%u\n",
+        rxPin, MEDIA_PICO_SPDIF_RX_PIN);
+    return false;
+  }
+
   if (mediaRoute.active && mediaRoute.activeRate == sampleRate &&
-      dspi.source == SRC_I2S) {
-    Serial.printf("MEDIA ROUTE: reused active %lu Hz route\n",
+      dspi.source == MEDIA_DSPI_SPDIF_SOURCE) {
+    Serial.printf("MEDIA ROUTE: reused active S/PDIF %lu Hz route\n",
                   (unsigned long)sampleRate);
     return true;
   }
 
-  uint32_t currentRate = 0;
-  uint32_t selectedRate = 0;
-  uint8_t clockMode = 0xFF;
-  uint8_t rxPin = 0xFF;
-  if (!getDspiInputRates(currentRate, selectedRate) ||
-      !getExactByte(REQ_GET_I2S_CLOCK_MODE, clockMode) ||
-      !getExactByte(REQ_GET_I2S_RX_PIN, rxPin, 0)) {
-    Serial.println("MEDIA ROUTE: failed to capture DSPi I2S configuration");
-    return false;
-  }
-
-  if (rxPin != MEDIA_PICO_RX_PIN) {
-    Serial.printf(
-        "MEDIA ROUTE: Pico pair-0 RX is GPIO%u; this checkpoint is wired to GPIO%u\n",
-        rxPin, MEDIA_PICO_RX_PIN);
-    return false;
-  }
-
   mediaRoute.active = false;
-
-  bool configured = true;
-  if (clockMode != 0) {
-    configured = dspiSetByte(REQ_SET_I2S_CLOCK_MODE, 0);
-  }
-  if (configured && selectedRate != sampleRate) {
-    configured = setDspiInputRate(sampleRate);
-  }
-
-  // The rate is a dormant store while another source is selected, so verify
-  // the selected half before asking DSPi to start the I2S input.
-  bool selectedVerified = false;
-  for (uint8_t attempt = 0; configured && attempt < 8; attempt++) {
-    delay(attempt == 0 ? 20 : 45);
-    if (getDspiInputRates(currentRate, selectedRate) &&
-        selectedRate == sampleRate) {
-      selectedVerified = true;
-      break;
-    }
-  }
   uint8_t liveSource = 0xFF;
   bool sourceKnown = getExactByte(REQ_GET_INPUT_SOURCE, liveSource) &&
                      liveSource <= SRC_MAX;
-  if (!selectedVerified ||
-      ((!sourceKnown || liveSource != SRC_I2S) &&
-       !setInputSource(SRC_I2S, userInitiated))) {
-    Serial.println("MEDIA ROUTE: failed before I2S source lock");
+
+  bool selected = true;
+  if (sourceKnown && liveSource == MEDIA_DSPI_SPDIF_SOURCE &&
+      !mediaDspiSourcePrimed) {
+    // A preset can boot DSPi directly into S/PDIF1 before a carrier exists.
+    // Its same-source SET path is intentionally a no-op, so force one genuine
+    // transition through always-available USB while the ESP is already
+    // transmitting encoded silence. This mirrors the proven manual recovery
+    // without touching User Volume.
+    Serial.println("MEDIA ROUTE: cold S/PDIF1 route; re-arming via USB");
+    selected = setInputSource(SRC_USB, false) &&
+               setInputSource(MEDIA_DSPI_SPDIF_SOURCE, false);
+  } else if (!sourceKnown || liveSource != MEDIA_DSPI_SPDIF_SOURCE) {
+    selected = setInputSource(MEDIA_DSPI_SPDIF_SOURCE, userInitiated);
+  }
+  if (!selected) {
+    Serial.println("MEDIA ROUTE: failed to select DSPi S/PDIF input 1");
     return false;
   }
-  dspi.source = SRC_I2S;
 
-  bool liveVerified = false;
-  for (uint8_t attempt = 0; attempt < 20; attempt++) {
-    delay(attempt == 0 ? 25 : 55);
-    uint8_t liveMode = 0xFF;
-    if (getExactByte(REQ_GET_I2S_CLOCK_MODE, liveMode) &&
-        getDspiInputRates(currentRate, selectedRate) &&
-        liveMode == 0 && currentRate == sampleRate &&
-        selectedRate == sampleRate) {
-      liveVerified = true;
+  // The transmitter starts immediately after this callback. DSPi remains in
+  // ACQUIRING until the output task's valid quarter-second silence lead-in is
+  // present, then its ordinary S/PDIF status polling publishes confirmed lock.
+  dspi.source = MEDIA_DSPI_SPDIF_SOURCE;
+  dspi.spdifState = 1;
+  dspi.spdifNonAudio = false;
+  dspi.sampleRate = sampleRate;
+
+  // startSpdif() has already filled and enabled a circular DMA ring containing
+  // valid consumer S/PDIF silence. Keep music parked in the PCM prefill ring
+  // until DSPi reports an exact audio lock at the file's native rate. This
+  // prevents the first decoded samples from straddling receiver acquisition.
+  const unsigned long lockDeadline = millis() + 1200;
+  bool locked = false;
+  do {
+    uint8_t statusPayload[16] = {0};
+    if (getExact(REQ_GET_SPDIF_RX_STATUS, 0, sizeof(statusPayload),
+                 statusPayload, sizeof(statusPayload), false) &&
+        statusPayload[0] == 2 &&
+        statusPayload[1] == (uint8_t)MEDIA_DSPI_SPDIF_SOURCE &&
+        readLe32(statusPayload + 4) == sampleRate) {
+      dspi.spdifState = 2;
+      dspi.sampleRate = sampleRate;
+      locked = true;
       break;
     }
-  }
-  if (!liveVerified) {
-    Serial.printf(
-        "MEDIA ROUTE: live verify failed current=%lu selected=%lu\n",
-        (unsigned long)currentRate, (unsigned long)selectedRate);
+    if ((long)(millis() - lockDeadline) >= 0) break;
+    delay(25);
+  } while ((long)(millis() - lockDeadline) < 0);
+
+  if (!locked) {
+    Serial.printf("MEDIA ROUTE: S/PDIF1 lock timeout expected-rate=%lu\n",
+                  (unsigned long)sampleRate);
     return false;
   }
 
-  // Publish the verified live I2S rate immediately.  Home therefore reports
-  // PCM 44.1/48 using the normal DSPi metadata path from the first track.
-  dspi.sampleRate = sampleRate;
+  mediaDspiSourcePrimed = true;
   mediaRoute.active = true;
   mediaRoute.activeRate = sampleRate;
   Serial.printf(
-      "MEDIA ROUTE: verified source=I2S rate=%lu mode=master rx=GPIO%u "
-      "BCLK=GPIO%u LRCLK=GPIO%u\n",
-      (unsigned long)sampleRate, rxPin, MEDIA_I2S_BCLK_PIN,
-      MEDIA_I2S_LRCLK_PIN);
+      "MEDIA ROUTE: selected source=S/PDIF1 expected-rate=%lu rx=GPIO%u "
+      "tx=GPIO%u awaiting wire lock\n",
+      (unsigned long)sampleRate, rxPin, MEDIA_SPDIF_DATA_OUT_PIN);
   return true;
 }
 
@@ -8656,11 +8726,9 @@ bool prepareDspiMediaRoute(uint32_t sampleRate, bool userInitiated)
     uint32_t currentRate = 0;
     uint32_t selectedRate = 0;
     uint8_t clockMode = 0xFF;
-    uint8_t rxPin = 0xFF;
     uint8_t source = 0xFF;
     if (!getDspiInputRates(currentRate, selectedRate) ||
         !getExactByte(REQ_GET_I2S_CLOCK_MODE, clockMode) ||
-        !getExactByte(REQ_GET_I2S_RX_PIN, rxPin, 0) ||
         !getExactByte(REQ_GET_INPUT_SOURCE, source) ||
         source > SRC_MAX) {
       Serial.println("MEDIA ROUTE: failed to capture DSPi configuration");
@@ -8672,7 +8740,7 @@ bool prepareDspiMediaRoute(uint32_t sampleRate, bool userInitiated)
     mediaRoute.source = (InputSource)source;
     mediaRoute.selectedRate = selectedRate;
     mediaRoute.clockMode = clockMode;
-    mediaRoute.rxPin = rxPin;
+    mediaRoute.rxPin = MEDIA_PICO_SPDIF_RX_PIN;
   }
 
   if (activateDspiMediaRoute(sampleRate, userInitiated)) return true;
@@ -9092,8 +9160,7 @@ bool startMediaPlaybackPrepared(const char *path,
   mediaRouteRestoreRetryAt = 0;
 
   bool started = mediaPlayerPoc.play(
-      path, MEDIA_I2S_BCLK_PIN, MEDIA_I2S_LRCLK_PIN,
-      MEDIA_I2S_DATA_OUT_PIN, mediaRouteCallback, nullptr, Serial);
+      path, MEDIA_SPDIF_DATA_OUT_PIN, mediaRouteCallback, nullptr, Serial);
   if (started) {
     strlcpy(mediaCurrentPath, path, sizeof(mediaCurrentPath));
     mediaPlaybackSuspended = false;
@@ -9108,9 +9175,9 @@ bool startMediaPlaybackAttempt(const char *path, bool preserveRouteOnFailure,
 {
   if (!path || !path[0]) return false;
   mediaTrackTransition = MediaTrackTransitionState{};
-  if (mediaPlayerPoc.playbackState() != MediaPlaybackState::Stopped) {
-    mediaPlayerPoc.stop();
-  }
+  // A direct start is not a cooperative transition. stop() is idempotent and
+  // also tears down a carrier retained during the one-loop Stopped window.
+  mediaPlayerPoc.stop();
   if (mediaPlayerPoc.playbackState() != MediaPlaybackState::Stopped) {
     return false;
   }
@@ -9219,7 +9286,7 @@ bool requestMediaTrackTransition(int candidateIndex, int direction, bool wrap,
           mediaQueuePaths[candidateIndex],
           sizeof(mediaTrackTransition.displayPath));
 
-  mediaPlayerPoc.requestStop();
+  mediaPlayerPoc.requestTrackTransitionStop();
   Serial.printf(
       "MEDIA TRANSITION: queued index=%d direction=%d auto=%s path=%s\n",
       candidateIndex, (int)mediaTrackTransition.direction,
@@ -9285,17 +9352,17 @@ void serviceMediaTrackTransition()
     Serial.printf("MEDIA TRANSITION: rejected index=%d path=%s reason=%s\n",
                   candidate, mediaQueuePaths[candidate],
                   mediaPlayerPoc.playbackError());
-    mediaPlayerPoc.requestStop();
-
     if (mediaTrackTransition.skipRejected &&
         mediaTrackTransition.attempts < mediaQueueCount &&
         moveMediaTransitionCandidate()) {
+      mediaPlayerPoc.requestTrackTransitionStop();
       mediaTrackTransition.phase = MediaTrackTransitionPhase::WaitForStop;
       if (uiView == VIEW_MEDIA_NOW_PLAYING && !mediaVolumeOverlayVisible) {
         drawMediaNowPlaying();
       }
       return;
     }
+    mediaPlayerPoc.requestStop();
     mediaTrackTransition.phase = MediaTrackTransitionPhase::FailureCleanup;
   };
 
@@ -9308,6 +9375,7 @@ void serviceMediaTrackTransition()
   if (mediaTrackTransition.phase == MediaTrackTransitionPhase::StartCandidate) {
     const int candidate = mediaTrackTransition.candidateIndex;
     if (candidate < 0 || candidate >= mediaQueueCount) {
+      mediaPlayerPoc.requestStop();
       mediaTrackTransition.phase = MediaTrackTransitionPhase::FailureCleanup;
       return;
     }
@@ -9315,8 +9383,7 @@ void serviceMediaTrackTransition()
     mediaRouteRestorePending = false;
     mediaRouteRestoreRetryAt = 0;
     bool prepared = mediaPlayerPoc.beginPlay(
-        mediaQueuePaths[candidate], MEDIA_I2S_BCLK_PIN,
-        MEDIA_I2S_LRCLK_PIN, MEDIA_I2S_DATA_OUT_PIN,
+        mediaQueuePaths[candidate], MEDIA_SPDIF_DATA_OUT_PIN,
         mediaRouteCallback, nullptr, Serial);
     if (!prepared) {
       handleRejected(candidate);
@@ -9374,8 +9441,10 @@ void stopMediaPlayback(const char *reason)
   cancelMediaArtworkRequest(true);
   if (mediaPlayerPoc.playbackState() != MediaPlaybackState::Stopped) {
     mediaPlayerPoc.printPlaybackStatus(Serial);
-    mediaPlayerPoc.stop();
   }
+  // Stopped may still own an intentionally retained same-rate carrier between
+  // transition phases. Genuine stop/input actions must always release it.
+  mediaPlayerPoc.stop();
   restoreDspiMediaRoute();
   mediaCurrentPath[0] = '\0';
   mediaPlaybackSuspended = false;
@@ -9391,8 +9460,8 @@ void parkMediaPlayback(const char *reason)
   cancelMediaArtworkRequest(false);
   if (mediaPlayerPoc.playbackState() != MediaPlaybackState::Stopped) {
     mediaPlayerPoc.printPlaybackStatus(Serial);
-    mediaPlayerPoc.stop();
   }
+  mediaPlayerPoc.stop();
   restoreDspiMediaRoute();
   mediaPlaybackSuspended = mediaCurrentPath[0] != '\0';
   Serial.printf("MEDIA PLAY: parked-at-start reason=%s path=%s\n",
@@ -9661,7 +9730,7 @@ uint8_t mediaBrowserActionOffset()
   if (!mediaBrowserShowsActions()) return 0;
   uint8_t count = mediaCurrentPath[0] ? 1 : 0;
   if (mediaPlayerPoc.mounted()) count++;
-  return count + 1;  // Wi-Fi Transfer is always the final root action.
+  return count;
 }
 
 bool mediaBrowserItemIsNowPlaying(uint8_t itemIndex)
@@ -9675,20 +9744,11 @@ bool mediaBrowserItemIsSettings(uint8_t itemIndex)
           itemIndex == (mediaCurrentPath[0] ? 1 : 0);
 }
 
-bool mediaBrowserItemIsWifiTransfer(uint8_t itemIndex)
-{
-  if (!mediaBrowserShowsActions()) return false;
-  uint8_t wifiIndex = mediaCurrentPath[0] ? 1 : 0;
-  if (mediaPlayerPoc.mounted()) wifiIndex++;
-  return itemIndex == wifiIndex;
-}
-
-
 uint8_t mediaBrowserItemCount()
 {
   uint8_t count = mediaBrowserEntryCount + mediaBrowserActionOffset();
   // Preserve the normal read-only SD probe action when the card has not yet
-  // mounted; Wi-Fi Transfer is a separate item and must not replace it.
+  // mounted.
   if (!mediaPlayerPoc.mounted() && mediaBrowserShowsActions()) count++;
   return count ? count : 1;
 }
@@ -9998,11 +10058,6 @@ void selectMediaMenuItem()
     enterPage(PAGE_MEDIA_SETTINGS);
     return;
   }
-  if (mediaBrowserItemIsWifiTransfer(menuIndex)) {
-    beginWifiTransferConfirmation();
-    return;
-  }
-
   if (!mediaPlayerPoc.mounted()) {
     showToast("Checking SD card...", 900);
     drawMenu();
@@ -10213,7 +10268,7 @@ bool loadPreset(uint8_t slot, bool announce)
     dspi.source = (InputSource)restoredSource;
     dspi.activePreset = slot;
     if (!activateDspiMediaRoute(mediaRate, false)) {
-      failAfterPossibleAcceptance("media I2S route reassert");
+      failAfterPossibleAcceptance("media S/PDIF route reassert");
       mediaPlayerPoc.stop();
       mediaCurrentPath[0] = '\0';
       mediaPlaybackSuspended = false;
@@ -10517,7 +10572,6 @@ String mediaBrowserItemName(uint8_t index)
 {
   if (mediaBrowserItemIsNowPlaying(index)) return "Now Playing";
   if (mediaBrowserItemIsSettings(index)) return "Playback Settings";
-  if (mediaBrowserItemIsWifiTransfer(index)) return "Wi-Fi Transfer";
   if (!mediaPlayerPoc.mounted()) return "Check SD card";
   int16_t entryIndex = mediaBrowserEntryIndex(index);
   if (entryIndex < 0) {
@@ -10538,13 +10592,32 @@ String mediaBrowserItemTag(uint8_t index)
     return mediaPlaybackSuspended ? "PAUSED" : "READY";
   }
   if (mediaBrowserItemIsSettings(index)) return "SET";
-  if (mediaBrowserItemIsWifiTransfer(index)) return "TRANSFER";
   if (!mediaPlayerPoc.mounted()) return "INSERT CARD";
   int16_t entryIndex = mediaBrowserEntryIndex(index);
   if (entryIndex < 0) return "";
   const MediaBrowserEntry &entry = mediaBrowserEntries[entryIndex];
   return entry.directory ? "FOLDER" :
          String(MediaPlayerPoC::formatName(entry.format));
+}
+
+bool mediaBrowserItemIsPlaying(uint8_t itemIndex)
+{
+  if (!mediaCurrentPath[0]) return false;
+  int16_t entryIndex = mediaBrowserEntryIndex(itemIndex);
+  if (entryIndex < 0) return false;
+
+  const MediaBrowserEntry &entry = mediaBrowserEntries[entryIndex];
+  if (!entry.directory) {
+    return strcmp(entry.path, mediaCurrentPath) == 0;
+  }
+
+  // A directory is on the playing track's path only when its complete path
+  // is followed by a separator. This prevents similarly named siblings such
+  // as "Album" and "Album 2" from both receiving the accent highlight.
+  const size_t directoryLength = strlen(entry.path);
+  return directoryLength > 0 &&
+         strncmp(entry.path, mediaCurrentPath, directoryLength) == 0 &&
+         mediaCurrentPath[directoryLength] == '/';
 }
 
 String sourceText()
@@ -10769,9 +10842,9 @@ uint8_t menuItemCount(MenuPage page)
     case PAGE_LEVELLER: return 6;
     case PAGE_PSYBASS: return 6;
     case PAGE_BLUETOOTH: return bleMenuItemCount();
-    case PAGE_SYSTEM: return 4;
+    case PAGE_SYSTEM: return 5;
     case PAGE_MEDIA_SETTINGS: return 1;
-    case PAGE_SCREEN_SETTINGS: return 4;
+    case PAGE_SCREEN_SETTINGS: return 5;
     case PAGE_IDLE_SCREEN:
       return screenTimeoutAction == SCREEN_TIMEOUT_DIM ? 5 : 4;
     case PAGE_THEME: return 4;
@@ -10812,15 +10885,18 @@ String menuItemName(MenuPage page, uint8_t index)
     return bleMenuItemName(index);
   }
   if (page == PAGE_SYSTEM) {
-    const char *items[] = {"Status", "Screen Settings", "Volume Limit", "Input Names"};
-    return items[std::min<uint8_t>(index, 3)];
+    const char *items[] = {
+      "Status", "Screen Settings", "Volume Limit", "WiFi Transfer/Update", "Input Names"
+    };
+    return items[std::min<uint8_t>(index, 4)];
   }
   if (page == PAGE_MEDIA_SETTINGS) return "Seek Step";
   if (page == PAGE_SCREEN_SETTINGS) {
     if (index == 0) return "Brightness";
     if (index == 1) return "Idle Settings";
     if (index == 2) return "Idle Screen";
-    return "Theme";
+    if (index == 3) return "Theme";
+    return "VU Source";
   }
   if (page == PAGE_IDLE_SCREEN) {
     if (index < 4) {
@@ -10928,6 +11004,7 @@ String currentEditValue()
   }
   if (menuPage == PAGE_SCREEN_SETTINGS) {
     if (menuIndex == 0) return String(editInt);
+    if (menuIndex == 4) return editBool ? "Input" : "Output";
     return screenTimeoutText((uint8_t)editInt);
   }
   if (menuPage == PAGE_IDLE_SCREEN) {
@@ -10991,7 +11068,8 @@ String menuItemValue(MenuPage page, uint8_t index)
     if (index == 0) return dspi.connected ? "Ready" : "Fault";
     if (index == 1) return "Open";
     if (index == 2) return String(dspi.masterVolumeDb, 1) + " dB";
-    return "Open";
+    if (index == 4) return "Open";
+    return "";
   }
   if (page == PAGE_MEDIA_SETTINGS) {
     return mediaSeekStepText(mediaSeekStepIndex);
@@ -11000,7 +11078,8 @@ String menuItemValue(MenuPage page, uint8_t index)
     if (index == 0) return String(brightnessPercent) + "%";
     if (index == 1) return screenTimeoutText(screenTimeoutOption);
     if (index == 2) return screenTimeoutActionText(screenTimeoutAction);
-    return "Open";
+    if (index == 3) return "Open";
+    return vuMeterSourceInput ? "Input" : "Output";
   }
   if (page == PAGE_IDLE_SCREEN) {
     if (index < 4) return "";
@@ -12319,11 +12398,27 @@ void drawChangeOverlay()
   } else {
     drawFontCentredGlowColour(FontSmall, 24, "Input", uiAccent());
     String source = inputSourceDisplayText(changeOverlaySource);
-    if (fontTextWidth(FontLarge, source) <= UI_W - 20) {
-      drawFontCentredGlowColour(FontLarge, 91, source, uiMainText());
-    } else {
-      drawFontCentredGlowColour(FontMedium, 119, source, uiMainText());
-    }
+    // Keep every input announcement in FontLarge. Previously S/PDIF 2/3/4
+    // crossed a width threshold and abruptly fell back to the much smaller
+    // FontMedium. Scale the same large glyphs only as much as required.
+    const int16_t maximumWidth = UI_W - 20;
+    const int16_t sourceWidth = fontTextWidthKerned(FontLarge, source);
+    const uint8_t sourceScale = sourceWidth > maximumWidth
+        ? (uint8_t)std::max<int16_t>(68,
+            (maximumWidth * 100L) / sourceWidth)
+        : 100;
+    const int16_t scaledWidth =
+        fontTextWidthScaledKerned(FontLarge, source, sourceScale);
+    const int16_t sourceX = std::max<int16_t>(0,
+        (UI_W - scaledWidth) / 2);
+    const int16_t sourceY = sourceScale == 100 ? 91 : 99;
+    const uint16_t sourceGlow = blend565(C_BLACK, uiMainText(), 82);
+    drawFontTextScaledKerned(FontLarge, sourceX + 1, sourceY, source,
+                             sourceGlow, sourceScale);
+    drawFontTextScaledKerned(FontLarge, sourceX, sourceY + 1, source,
+                             sourceGlow, sourceScale);
+    drawFontTextScaledKerned(FontLarge, sourceX, sourceY, source,
+                             uiMainText(), sourceScale);
   }
   flushCanvasLocked();
 }
@@ -12619,6 +12714,12 @@ void transitionToHome()
        __atomic_load_n(&mediaArtworkWorkerBusy, __ATOMIC_ACQUIRE))) {
     cancelMediaArtworkRequest(false);
   }
+  // Home depends on confirmed S/PDIF receiver metadata for both its PCM label
+  // and meter admission. Ask the lightweight watcher for an immediate exact
+  // status read instead of waiting for its ordinary 1.2-second cadence.
+  if (mediaPlayerPoc.active() && isSpdifSource(dspi.source)) {
+    externalRuntimeRefreshRequested = true;
+  }
   fadeUiOut();
   drawHome();
   fadeUiIn();
@@ -12642,15 +12743,6 @@ void drawMediaBrowserIcon(uint8_t itemIndex, int16_t x, int16_t y,
     canvas->fillCircle(x + 8, y + 14, 2, colour);
     return;
   }
-  if (mediaBrowserItemIsWifiTransfer(itemIndex)) {
-    canvas->drawCircle(x + 9, y + 14, 2, colour);
-    canvas->drawCircle(x + 9, y + 14, 6, colour);
-    canvas->drawCircle(x + 9, y + 14, 10, colour);
-    canvas->fillRect(x - 2, y + 14, 23, 8, C_BLACK);
-    canvas->fillCircle(x + 9, y + 14, 2, colour);
-    return;
-  }
-
   int16_t entryIndex = mediaBrowserEntryIndex(itemIndex);
   if (entryIndex >= 0 && mediaBrowserEntries[entryIndex].directory) {
     canvas->drawRect(x + 1, y + 5, 17, 11, colour);
@@ -12681,22 +12773,24 @@ void drawMediaBrowserRow(uint8_t itemIndex, uint8_t visibleRow,
   int16_t tagX = UI_W - tagWidth - 12;
   int16_t textX = 34;
   int16_t textWidth = std::max<int16_t>(62, tagX - textX - 10);
+  const uint16_t rowColour = mediaBrowserItemIsPlaying(itemIndex)
+      ? uiAccent() : uiMainText();
 
-  drawMediaBrowserIcon(itemIndex, 10, rowY + 7, uiMainText());
+  drawMediaBrowserIcon(itemIndex, 10, rowY + 7, rowColour);
 
   int16_t titleWidth = fontTextWidth(FontMedium, title);
   if (selected && titleWidth > textWidth) {
     drawFontTextClipped(FontMedium, textX - mediaMarqueeOffset, rowY + 2,
-                        title, uiMainText(), textX, rowY, textWidth, rowH);
+                        title, rowColour, textX, rowY, textWidth, rowH);
   } else {
     String shown = selected ? title :
                    ellipsizeFontText(FontMedium, title, textWidth);
-    drawFontTextClipped(FontMedium, textX, rowY + 2, shown, uiMainText(),
+    drawFontTextClipped(FontMedium, textX, rowY + 2, shown, rowColour,
                         textX, rowY, textWidth, rowH);
   }
 
   if (tag.length()) {
-    drawFontText(FontSmall, tagX, rowY + 6, tag, uiMainText());
+    drawFontText(FontSmall, tagX, rowY + 6, tag, rowColour);
   }
 }
 
@@ -13633,6 +13727,7 @@ void beginEdit()
     editInt = mediaSeekStepIndex;
   } else if (menuPage == PAGE_SCREEN_SETTINGS) {
     if (menuIndex == 0) editInt = brightnessPercent;
+    else if (menuIndex == 4) editBool = vuMeterSourceInput;
     else editInt = screenTimeoutOption;
   } else if (menuPage == PAGE_IDLE_SCREEN) {
     editInt = screenDimPercent;
@@ -13721,6 +13816,8 @@ void adjustEdit(int direction)
       applyBrightness();
     } else if (menuIndex == 1) {
       editInt = wrapEditInt(editInt, direction, 1, 0, 4);
+    } else if (menuIndex == 4) {
+      editBool = !editBool;
     }
   } else if (menuPage == PAGE_IDLE_SCREEN) {
     editInt = wrapEditInt(editInt, direction, 10, 10, 80);
@@ -13758,7 +13855,7 @@ void applyEdit()
     // we're already at the last position, auto-advance so typing a name is a
     // simple repeated rotate-then-click without a toast popping up after
     // every single letter. The name itself is only persisted when the user
-    // backs out of this page (see backOut()).
+    // backs out of this page (see commitInputNameEdit() via goBack()).
     if (menuIndex < INPUT_NAME_MAX_LEN) {
       inputNameEditBuffer[menuIndex] =
           INPUT_NAME_CHARSET[constrain(editInt, 0, INPUT_NAME_CHARSET_LEN - 1)];
@@ -13777,9 +13874,13 @@ void applyEdit()
   String failureText = "DSPi error";
   if (menuPage == PAGE_INPUT) {
     InputSource selectedSource = (InputSource)editInt;
-    // Merely selecting I2S never starts or interrupts music.  Selecting any
-    // other DSPi source owns the route and stops the ESP32 player first.
-    if (mediaPlayerPoc.active() && selectedSource != SRC_I2S) {
+    // Any genuine input change takes ownership from the ESP S/PDIF player.
+    // Clear even a parked/paused queue so a later Play cannot unexpectedly
+    // reclaim S/PDIF after the listener deliberately selected another input.
+    const bool mediaSessionPresent = mediaPlayerPoc.active() ||
+        mediaPlaybackSuspended || mediaCurrentPath[0] ||
+        mediaTrackTransitionActive();
+    if (mediaSessionPresent && selectedSource != dspi.source) {
       stopMediaPlayback("input menu");
     }
     if (mediaRouteRestorePending && mediaRoute.captured &&
@@ -13818,14 +13919,27 @@ void applyEdit()
   } else if (menuPage == PAGE_SYSTEM && menuIndex == 2) {
     const bool originalMute = dspi.muted;
     const float originalMaster = dspi.masterVolumeDb;
-    const bool hold = mediaPlayerPoc.beginExternalHold(800);
-    bool releaseSafe = false;
+    const bool mediaSessionPresent = mediaPlayerPoc.active() ||
+        mediaPlaybackSuspended || mediaCurrentPath[0] ||
+        mediaTrackTransitionActive();
     bool limitPersisted = false;
 
-    if (!hold) {
+    // DSPi persists the independent ceiling in flash. Use the same proven
+    // boundary as preset saving: completely stop the transmitter, restore the
+    // prior physical route, and verify cleanup before starting the flash
+    // transaction. A quiescent-but-live S/PDIF task can otherwise outlive an
+    // ambiguous DSPi blackout and remain held until a power cycle.
+    if (mediaSessionPresent) {
+      stopMediaPlayback("volume limit flash guard");
+    }
+    const bool mediaStopped = !mediaPlayerPoc.active() &&
+        !mediaTrackTransitionActive() && !mediaRouteRestorePending;
+
+    if (!mediaStopped) {
       ok = false;
-      failureText = "Limit busy - try again";
-      Serial.println("VOLUME LIMIT TX: refused; Media output could not become quiescent");
+      failureText = "Music stop failed";
+      Serial.println(
+          "VOLUME LIMIT TX: refused; Media stop/route cleanup incomplete");
     } else {
       const bool muted = setUserMuteVerified(true);
       const bool independent = muted && ensureIndependentMasterVolumeModeVerified();
@@ -13835,38 +13949,33 @@ void applyEdit()
 
       if (ok) {
         const bool muteRestored = setUserMuteVerified(originalMute);
-        if (muteRestored) {
-          releaseSafe = true;
-        } else {
+        if (!muteRestored) {
           // The new limit is durable, but the former mute state could not be
-          // proven. Keep DSPi muted; release I2S only after that safe fallback
-          // is verified.
+          // proven. Keep DSPi in an explicitly verified safe-muted state; the
+          // Media task is already fully stopped and can be started normally.
           const bool safeMute = setUserMuteVerified(true);
-          releaseSafe = safeMute;
           ok = false;
           failureText = safeMute ? "Limit saved - muted"
-                                 : "Limit saved - output held";
+                                 : "Limit saved - mute error";
         }
       } else {
         // Do not leave a partially changed live limit. Restore the original
-        // ceiling where possible and independently verify mute before releasing
-        // Media. No DSP command is issued at all when hold acquisition failed.
+        // ceiling where possible and independently verify a safe mute. There
+        // is no retained ESP hold, so a later playback attempt cannot inherit
+        // a latched output-task state from this failure path.
         const bool masterRestored = setMasterVolumeVerified(originalMaster);
         const bool safeMute = setUserMuteVerified(true);
-        releaseSafe = masterRestored && safeMute;
-        failureText = releaseSafe ? "Limit failed - muted"
-                                  : "Limit failed - output held";
-      }
-
-      if (releaseSafe) {
-        mediaPlayerPoc.endExternalHold();
-      } else {
-        Serial.printf("VOLUME LIMIT TX: SAFETY HOLD RETAINED persisted=%s; "
-                      "power cycle required\n",
-                      limitPersisted ? "yes" : "no");
+        Serial.printf("VOLUME LIMIT TX: recovery persisted=%s "
+                      "master_restore=%s mute_guard=%s\n",
+                      limitPersisted ? "yes" : "no",
+                      masterRestored ? "OK" : "FAILED",
+                      safeMute ? "OK" : "FAILED");
+        failureText = masterRestored && safeMute
+            ? "Limit failed - muted" : "Limit recovery error";
       }
     }
-    successText = "Global limit saved";
+    successText = mediaSessionPresent ? "Limit saved - music stopped"
+                                      : "Global limit saved";
   } else if (menuPage == PAGE_MEDIA_SETTINGS) {
     mediaSeekStepIndex = (uint8_t)constrain(editInt, 0, 2);
     markDeferredPreference(PREF_DIRTY_PANEL_SETTINGS);
@@ -13877,6 +13986,12 @@ void applyEdit()
       applyBrightness();
     } else if (menuIndex == 1) {
       screenTimeoutOption = (uint8_t)editInt;
+    } else if (menuIndex == 4) {
+      vuMeterSourceInput = editBool;
+      // Switching source can jump the reading a long way (e.g. a hot input
+      // feeding a quiet output). Clear ballistics/peak-hold so the meters
+      // don't visibly sweep from the old source's level to the new one.
+      resetMetersForStateChange("VU source changed");
     }
     markDeferredPreference(PREF_DIRTY_PANEL_SETTINGS);
     recordUserActivity();
@@ -14003,6 +14118,11 @@ void selectMenuItem()
   }
 
   if (menuPage == PAGE_SYSTEM && menuIndex == 3) {
+    beginWifiTransferConfirmation();
+    return;
+  }
+
+  if (menuPage == PAGE_SYSTEM && menuIndex == 4) {
     enterPage(PAGE_INPUT_NAMES);
     return;
   }
@@ -14153,7 +14273,10 @@ void changeInput(int direction)
     return;
   }
   InputSource target = nextInputSourceChoice(baseSource, direction);
-  if (mediaPlayerPoc.active() && target != SRC_I2S) {
+  const bool mediaSessionPresent = mediaPlayerPoc.active() ||
+      mediaPlaybackSuspended || mediaCurrentPath[0] ||
+      mediaTrackTransitionActive();
+  if (mediaSessionPresent && target != baseSource) {
     stopMediaPlayback("input change");
   }
   if (target == baseSource || !setInputSource(target, true)) {
@@ -14285,11 +14408,11 @@ void dispatchUiAction(UiAction action)
       drawWifiTransferConfirmation();
     } else if (action == ACT_SELECT) {
       if (wifiTransferConfirmStart) requestWifiTransferEntry();
-      else enterPage(PAGE_MEDIA);
+      else enterPage(PAGE_SYSTEM);
     } else if (action == ACT_HOME) {
       transitionToHome();
     } else if (action == ACT_BACK || action == ACT_MENU_TOGGLE) {
-      enterPage(PAGE_MEDIA);
+      enterPage(PAGE_SYSTEM);
     }
     return;
   }
@@ -14302,7 +14425,7 @@ void dispatchUiAction(UiAction action)
     if (action == ACT_HOME) transitionToHome();
     else if (action == ACT_SELECT || action == ACT_BACK ||
              action == ACT_MENU_TOGGLE) {
-      enterPage(PAGE_MEDIA);
+      enterPage(PAGE_SYSTEM);
     }
     return;
   }
@@ -16784,6 +16907,7 @@ void serviceDeferredPreferences()
          preferences.putUChar("screen_to", screenTimeoutOption) == 1 &&
          preferences.putUChar("screen_dim", screenDimPercent) == 1 &&
          preferences.putUChar("screen_act", screenTimeoutAction) == 1 &&
+         preferences.putUChar("vu_src", vuMeterSourceInput ? 1 : 0) == 1 &&
          preferences.putUChar("media_seek", mediaSeekStepIndex) == 1 &&
          preferences.putUChar("media_set_ver", MEDIA_SETTINGS_VERSION) == 1 &&
          persistThemePreferencesNow();
@@ -17167,7 +17291,7 @@ void finishWifiTransferLifecycle()
   }
 
   showToast("Transfer complete", 1800);
-  enterPage(PAGE_MEDIA);
+  enterPage(PAGE_SYSTEM);
 }
 
 void serviceWifiTransferUiRedraw()
@@ -18157,6 +18281,8 @@ void setup()
   }
   if (screenDimPercent == 0) screenDimPercent = 20;
 
+  vuMeterSourceInput = preferences.getUChar("vu_src", 0) != 0;
+
   for (uint8_t i = 0; i < SRC_COUNT; i++) {
     char key[16];
     snprintf(key, sizeof(key), "in_nm_%u", (unsigned)i);
@@ -18344,11 +18470,12 @@ void loop()
       const bool externalSourceChanged =
           dspi.source != sourceBeforeRuntimePoll;
 
-      // A Console source selection away from I2S takes ownership immediately.
+      // A Console source selection away from the media S/PDIF input takes
+      // ownership immediately.
       // Point the pending restore at that already-selected source so stopping
-      // music restores only the saved I2S rate/clock and never overrides the
-      // Console's choice.
-      if (externalSourceChanged && dspi.source != SRC_I2S &&
+      // music never overrides the Console's choice when playback stops.
+      if (externalSourceChanged &&
+          dspi.source != MEDIA_DSPI_SPDIF_SOURCE &&
           mediaPlayerPoc.active()) {
         const InputSource externalSource = dspi.source;
         if (mediaRoute.captured) mediaRoute.source = externalSource;
